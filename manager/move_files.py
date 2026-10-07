@@ -4,6 +4,7 @@ import os
 import sys
 from shutil import move, copy
 from datetime import datetime
+from math import isfinite
 import re
 import yaml
 from collections import defaultdict
@@ -13,10 +14,14 @@ TIME_TAG_PATTERNS = (
     re.compile(r"\d{8}_\d{6}"),
     re.compile(r"\d{4}-\d{2}-\d{2}[_-]\d{2}-\d{2}-\d{2}"),
 )
+TIME_FILTER_FORMAT = '%Y-%m-%d-%H-%M-%S'
 SWEEP_SPLIT_PATTERN = re.compile(r"_sweep_", re.IGNORECASE)
 NUMERIC_TOKEN_PATTERN = re.compile(r"^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$")
 TOKEN_WITH_TRAILING_NUMERIC_PATTERN = re.compile(
     r"^(?P<prefix>[A-Za-z_][A-Za-z0-9_]*?)(?P<value>[+-]?\d.*)$"
+)
+MANUAL_TIME_RANGE_PATTERN = re.compile(
+    r"^\s*(\d{4}(?:-\d{2}){5})\s+-\s+(\d{4}(?:-\d{2}){5})\s*$"
 )
 
 
@@ -34,9 +39,71 @@ def get_manager_config():
     return config
 
 
-def get_current_measurement_file(config):
+def _parse_time_bound(value, name):
+    if value is None:
+        return None
+    try:
+        return datetime.strptime(value, TIME_FILTER_FORMAT)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f'{name} must be a valid timestamp in YYYY-MM-DD-HH-MM-SS format') from error
+
+
+def _extract_file_timestamps(filename):
+    timestamps = []
+    for tag in _extract_time_tags(filename):
+        if len(tag) == 15:
+            time_format = '%Y%m%d_%H%M%S'
+        else:
+            time_format = TIME_FILTER_FORMAT
+            tag = tag.replace('_', '-')
+        try:
+            timestamps.append(datetime.strptime(tag, time_format))
+        except ValueError:
+            continue
+    return sorted(timestamps)
+
+
+def _matches_time_range(filename, data_before, data_after):
+    if data_before is None and data_after is None:
+        return True
+    return any(
+        (data_before is None or timestamp <= data_before)
+        and (data_after is None or timestamp >= data_after)
+        for timestamp in _extract_file_timestamps(filename)
+    )
+
+
+def _filter_measurement_files(
+        files, experiment_type=None, sweep_param=None,
+        data_before=None, data_after=None):
+    data_before = _parse_time_bound(data_before, 'data_before')
+    data_after = _parse_time_bound(data_after, 'data_after')
+    if (data_before is not None and data_after is not None
+            and data_after > data_before):
+        raise ValueError('data_after must be earlier than or equal to data_before')
+
+    parameter_name = sweep_param
+    if sweep_param is not None:
+        keys = re.findall(r"\[\s*['\"]([^'\"]+)['\"]\s*\]", sweep_param)
+        if keys:
+            parameter_name = keys[-1]
+
+    return [
+        file for file in files
+        if (experiment_type is None
+            or Path(file).name.startswith(experiment_type))
+        and (parameter_name is None or parameter_name in Path(file).stem)
+        and _matches_time_range(file, data_before, data_after)
+    ]
+
+
+def get_current_measurement_file(
+        config, experiment_type=None, data_before=None, data_after=None):
     file_type = config['file_type']
-    files = glob('*'+file_type)
+    files = _filter_measurement_files(
+        glob('*'+file_type), experiment_type=experiment_type,
+        data_before=data_before, data_after=data_after)
     if len(files) == 0:
         print('Could not find any measurement files '
               f'matching the configured file extension {file_type}')
@@ -48,9 +115,13 @@ def get_current_measurement_file(config):
         return files[file_index]
 
 
-def _get_sweep_files(config):
+def _get_sweep_files(
+        config, experiment_type=None, sweep_param=None,
+        data_before=None, data_after=None):
     file_type = config['file_type']
-    files = glob('*' + file_type)
+    files = _filter_measurement_files(
+        glob('*' + file_type), experiment_type, sweep_param,
+        data_before=data_before, data_after=data_after)
     files.sort()
     sweepfiles = []
     for file in files:
@@ -61,10 +132,10 @@ def _get_sweep_files(config):
     return sweepfiles
 
 
-def file_selector(files):
+def file_selector(files, description='files'):
     while True:
         print(
-            f"Found multiple files! Please select one of the following {len(files)} files:")
+            f"Found multiple {description}! Please select one of the following {len(files)} {description}:")
         for i, file in enumerate(files, 1):
             print(f"{i} -> {file}")
         choice = input('\nYour Choice: ')
@@ -82,7 +153,9 @@ def _add_yaml_if_configured(config, files):
                 files.append(yaml_file)
 
 
-def _add_channel_companion_files(files):
+def _add_channel_companion_files(
+        files, experiment_type=None, sweep_param=None,
+        data_before=None, data_after=None, sweep_variant=None):
     channel_files = [file for file in files if "_ch-" in Path(file).name]
     if not channel_files:
         return
@@ -94,9 +167,15 @@ def _add_channel_companion_files(files):
     if not channel_tags:
         return
 
-    candidates = glob("*.npy") + glob("*.yaml")
+    candidates = _filter_measurement_files(
+        glob("*.npy") + glob("*.yaml"), experiment_type, sweep_param,
+        data_before=data_before, data_after=data_after)
     for candidate in candidates:
         if candidate in files:
+            continue
+        if (sweep_variant is not None
+                and ('sweep' in candidate or '_ch-' in candidate)
+                and _extract_sweep_variant_key(candidate) != sweep_variant):
             continue
         candidate_tags = _extract_time_tags(candidate)
         if channel_tags.intersection(candidate_tags):
@@ -119,7 +198,7 @@ def _extract_time_tags(filename):
     return tags
 
 
-def _filter_images_by_time_tag(images, measurement_files):
+def _filter_images_by_time_tag(images, measurement_files, sweep_variant=None):
     measurement_tags = set()
     for measurement_file in measurement_files:
         measurement_tags.update(_extract_time_tags(measurement_file))
@@ -129,6 +208,10 @@ def _filter_images_by_time_tag(images, measurement_files):
 
     matching_images = []
     for image in images:
+        if (sweep_variant is not None
+                and SWEEP_SPLIT_PATTERN.search(Path(image).stem)
+                and _extract_sweep_variant_key(image) != sweep_variant):
+            continue
         image_tags = _extract_time_tags(image)
         if measurement_tags.intersection(image_tags):
             matching_images.append(image)
@@ -153,15 +236,22 @@ def _select_files_with_same_time_tag(files):
     return matching_files
 
 
-def _extract_sweep_parameter_key(filename):
+def _strip_sweep_metadata(filename):
     stem = Path(filename).stem
+    for pattern in TIME_TAG_PATTERNS:
+        match = pattern.search(stem)
+        if match:
+            stem = stem[:match.start()]
+    return re.sub(r'_ch-[^_]+', '', stem).strip('_-')
+
+
+def _extract_sweep_parameter_key(filename):
+    stem = _strip_sweep_metadata(filename)
     split = SWEEP_SPLIT_PATTERN.split(stem, maxsplit=1)
     if len(split) < 2:
         return None
 
     sweep_part = split[1]
-    for pattern in TIME_TAG_PATTERNS:
-        sweep_part = pattern.sub("", sweep_part)
     sweep_part = sweep_part.strip("_-")
     if not sweep_part:
         return None
@@ -186,16 +276,112 @@ def _extract_sweep_parameter_key(filename):
     return "_".join(key_tokens)
 
 
+def _extract_sweep_variant_key(filename):
+    stem = _strip_sweep_metadata(filename)
+    parameter = _extract_sweep_parameter_key(filename)
+    if parameter is None:
+        return stem
+    experiment = SWEEP_SPLIT_PATTERN.split(stem, maxsplit=1)[0]
+    return experiment + '_sweep_' + parameter
+
+
 def _group_sweep_files_by_parameter(files):
     groups = defaultdict(list)
     for file in files:
-        key = _extract_sweep_parameter_key(file)
-        if key is None:
-            key = "__unknown_parameter__"
+        key = _extract_sweep_variant_key(file)
         groups[key].append(file)
     for key in groups:
         groups[key].sort()
     return groups
+
+
+def _select_sweep_variant(files):
+    groups = _group_sweep_files_by_parameter(files)
+    variants = sorted(groups)
+    if len(variants) == 1:
+        return files, variants[0]
+    options = [
+        f'{variant} ({len(groups[variant])} measurement files)'
+        for variant in variants
+    ]
+    variant = variants[file_selector(options, description='sweep variants')]
+    return groups[variant], variant
+
+
+def _group_sweep_files_by_time(files, sweep_gap_factor):
+    timed_files = []
+    untimed_files = []
+    for file in files:
+        timestamps = _extract_file_timestamps(file)
+        if timestamps:
+            timed_files.append((timestamps[0], file))
+        else:
+            untimed_files.append(file)
+    timed_files.sort()
+
+    groups = []
+    previous_timestamp = None
+    previous_gap = None
+    for timestamp, file in timed_files:
+        gap = (timestamp - previous_timestamp
+               if previous_timestamp is not None else None)
+        if (not groups or (previous_gap is not None
+                           and gap > previous_gap * sweep_gap_factor)):
+            groups.append([])
+        groups[-1].append((timestamp, file))
+        # Channel files sharing a timestamp must not reset the previous gap to zero.
+        if gap is not None and gap.total_seconds() > 0:
+            previous_gap = gap
+        previous_timestamp = timestamp
+    ranges = [
+        (sorted(file for _, file in group), group[0][0], group[-1][0])
+        for group in groups
+    ]
+    if untimed_files:
+        ranges.append((sorted(untimed_files), None, None))
+    return ranges
+
+
+def _select_sweep_time_range(files, sweep_gap_factor):
+    ranges = _group_sweep_files_by_time(files, sweep_gap_factor)
+    if len(ranges) == 1:
+        return files, None, None
+
+    while True:
+        print('Found potentially separate sweeps: a timestamp gap exceeded '
+              f'{sweep_gap_factor:g} times the preceding gap, or files lack valid timestamps.')
+        print(f'0 -> Move all {len(files)} measurement files into one folder')
+        for index, (group, start, end) in enumerate(ranges, 1):
+            label = (f'{start.strftime(TIME_FILTER_FORMAT)} - {end.strftime(TIME_FILTER_FORMAT)}'
+                     if start is not None else 'Files without valid timestamps')
+            print(f'{index} -> {label} ({len(group)} measurement files)')
+        print('Enter a number or an inclusive time range in this format:')
+        print('YYYY-MM-DD-HH-MM-SS - YYYY-MM-DD-HH-MM-SS')
+        print('Example: 2026-10-07-16-12-45 - 2026-10-07-18-10-31')
+        choice = input('\nYour Choice: ').strip()
+        if choice.isdigit():
+            index = int(choice)
+            if index == 0:
+                return files, None, None
+            if 1 <= index <= len(ranges):
+                group, start, end = ranges[index - 1]
+                return (group, end.strftime(TIME_FILTER_FORMAT) if end else None,
+                        start.strftime(TIME_FILTER_FORMAT) if start else None)
+        else:
+            match = MANUAL_TIME_RANGE_PATTERN.fullmatch(choice)
+            if match:
+                data_after, data_before = match.groups()
+                try:
+                    selected = _filter_measurement_files(
+                        files, data_after=data_after, data_before=data_before)
+                except ValueError as error:
+                    print(error)
+                    continue
+                if selected:
+                    return selected, data_before, data_after
+                print('No measurement files match that time range. Please try again.')
+                continue
+        print('Your choice was invalid, please try again!')
 
 
 def move_images(images, basefile, config, sweep=False):
@@ -319,10 +505,14 @@ def _write_lab_log_if_configured(
 
 
 
-def move_data(include_comments=True):
+def move_data(
+        include_comments=True, experiment_type=None,
+        data_before=None, data_after=None):
+    """Move a measurement matching an optional prefix and inclusive time bounds."""
     config = get_manager_config()
     files_to_move = []
-    files_to_move.append(get_current_measurement_file(config))
+    files_to_move.append(get_current_measurement_file(
+        config, experiment_type, data_before=data_before, data_after=data_after))
     _add_yaml_if_configured(config, files_to_move)
     image_files = _get_images_if_configured(config)
     image_files = _filter_images_by_time_tag(image_files, files_to_move)
@@ -333,13 +523,31 @@ def move_data(include_comments=True):
     image_files = move_images(image_files, files_to_move[0], config)
 
 
-def move_sweep(include_comments=True):
+def move_sweep(
+        include_comments=True, experiment_type=None, sweep_param=None,
+        data_before=None, data_after=None, sweep_gap_factor=2):
+    """Select a sweep variant and time range, then move its related files."""
     config = get_manager_config()
-    files_to_move = _get_sweep_files(config)
+    files_to_move = _get_sweep_files(
+        config, experiment_type, sweep_param,
+        data_before=data_before, data_after=data_after)
+    # Validate the gap before asking the user to select a variant.
+    if not isfinite(sweep_gap_factor) or sweep_gap_factor <= 1:
+        raise ValueError('sweep_gap_factor must be finite and greater than 1')
+    files_to_move, sweep_variant = _select_sweep_variant(files_to_move)
+    files_to_move, selected_before, selected_after = _select_sweep_time_range(
+        files_to_move, sweep_gap_factor)
+    if selected_before is not None:
+        data_before = selected_before
+    if selected_after is not None:
+        data_after = selected_after
     _add_yaml_if_configured(config, files_to_move)
-    _add_channel_companion_files(files_to_move)
+    _add_channel_companion_files(
+        files_to_move, experiment_type, sweep_param,
+        data_before=data_before, data_after=data_after, sweep_variant=sweep_variant)
     image_files = _get_images_if_configured(config)
-    image_files = _filter_images_by_time_tag(image_files, files_to_move)
+    image_files = _filter_images_by_time_tag(
+        image_files, files_to_move, sweep_variant=sweep_variant)
     shared_comment = None
     if config['keep_lab_log'] and include_comments:
         shared_comment = input('Please enter a comment about this measurement: ')
