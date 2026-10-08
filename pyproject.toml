@@ -1,21 +1,28 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = 'pylab_manager'
 version = '0.1.0'
 description = 'Initialize new measurement repos'
-license = {text = 'No license of for commercial or non-commercial use is granted'}
+readme = "README.md"
+requires-python = ">= 3.10"
+license = "LicenseRef-Proprietary"
+authors = [
+  {name = "Karl Briegel", email = "karl.briegel@tum.de"},
+  {name = "Julia Draeger", email = "julia.draeger@tum.de"},
+]
 dependencies = ['pyyaml', 'ruamel.yaml']
-#author = 'Karl Briegel'
-#author_email = 'karl.briegel@tum.de'
 
-[tool.setuptools.packages]
-find = {}
+[project.optional-dependencies]
+notebooks = ["nbconvert"]
 
 [project.scripts]
 manager = "manager:entry"
+
+[tool.setuptools.packages]
+find = {}
 
 [tool.mypy]
 check_untyped_defs = true
