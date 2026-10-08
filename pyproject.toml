@@ -7,7 +7,7 @@ name = 'pylab_manager'
 version = '0.1.0'
 description = 'Initialize new measurement repos'
 license = {text = 'No license of for commercial or non-commercial use is granted'}
-dependencies = ['pyyaml']
+dependencies = ['pyyaml', 'ruamel.yaml']
 #author = 'Karl Briegel'
 #author_email = 'karl.briegel@tum.de'
 
